@@ -22,12 +22,19 @@ from typing import Any
 import boto3
 import chromadb
 from adapters import AutoAdapterModel
+from adapters.composition import Stack
 from dotenv import load_dotenv
 from transformers import AutoTokenizer
 
 load_dotenv()
 
 logger = logging.getLogger(__name__)
+
+# The adapters library emits a spurious WARNING during load_adapter ("none are
+# activated") before set_active_adapters is called. Suppress it at module load
+# so it doesn't pollute evaluator output; the adapter is correctly activated
+# immediately after loading via set_active_adapters(Stack("[PRX]")).
+logging.getLogger("adapters.model_mixin").setLevel(logging.ERROR)
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -74,7 +81,8 @@ def _load_model() -> tuple[Any, Any]:
         _model = AutoAdapterModel.from_pretrained(SPECTER2_BASE)
 
         logger.info("Loading SPECTER2 proximity adapter")
-        _model.load_adapter(SPECTER2_ADAPTER, source="hf", set_active=True)
+        _model.load_adapter(SPECTER2_ADAPTER, source="hf")
+        _model.set_active_adapters(Stack("[PRX]"))
         _model.eval()
         logger.info("SPECTER2 model ready")
 
