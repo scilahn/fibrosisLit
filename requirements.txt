@@ -1,3 +1,4 @@
+# Python 3.11.15
 adapters==1.2.0
 annotated-doc==0.0.4
 annotated-types==0.7.0
