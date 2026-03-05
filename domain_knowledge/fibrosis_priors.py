@@ -8,6 +8,8 @@ flag contested frameworks, and surface known model limitations rather than
 silently treating all peer-reviewed data as equivalent.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from enum import Enum
 
