@@ -1,9 +1,8 @@
 """
 fibrosis_priors.py — Biological priors for IPF/PSC evidence evaluation.
 
-Domain knowledge encoded by Richard Ahn, PhD (Pliant Therapeutics).
-Structure provided by Claude Code. Biology is authoritative; structure is not.
-
+Domain knowledge encoded by Richard Ahn, PhD 
+Structure provided by Claude Code
 Evaluators import from this module to weight evidence by translational relevance,
 flag contested frameworks, and surface known model limitations rather than
 silently treating all peer-reviewed data as equivalent.
