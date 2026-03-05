@@ -19,15 +19,15 @@ UNKNOWN_MODEL_FALLBACK_SCORE: float = 0.2
 
 
 @dataclass(frozen=True)
-class PreclinicalModel:
+class Model:
     """
-    A preclinical or clinical model system with its IPF translational relevance score
-    and the biological reasoning behind that score.
+    A model system (preclinical or clinical) with its IPF translational relevance
+    score and the biological reasoning behind that score.
 
     Attributes:
         name:      Canonical identifier used across evaluators.
         score:     Translational relevance score in [0, 1]. Higher = more directly
-                   translatable to human IPF biology.
+                   translatable to human IPF biology. Clinical trials score 1.0.
         rationale: Biological justification for the assigned score. Should explain
                    *why* this model does or does not recapitulate human disease,
                    not merely describe the model itself.
@@ -41,15 +41,53 @@ class PreclinicalModel:
 
 
 # ---------------------------------------------------------------------------
-# Preclinical model hierarchy — IPF translational relevance
+# Model hierarchy — IPF translational relevance
 #
 # Ranked by how faithfully each system recapitulates human IPF biology:
 # cell type composition, fibrotic microenvironment, disease chronicity,
 # and pharmacological translatability to clinical outcomes.
+# Clinical trials (Phase I–III) are the highest-evidence tier (score = 1.0)
+# because they measure drug effects directly in living IPF patients.
 # ---------------------------------------------------------------------------
 
-PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
-    "human_biopsy_scrnaseq": PreclinicalModel(
+MODELS: dict[str, Model] = {
+    "phase_3_clinical_trial": Model(
+        name="phase_3_clinical_trial",
+        score=1.0,
+        rationale=(
+            "Phase III randomised controlled trial in human IPF patients. "
+            "The highest evidence tier: powered for clinical endpoints (FVC decline, "
+            "mortality), placebo-controlled, and subject to regulatory review. "
+            "Positive findings are directly actionable; negative findings definitively "
+            "de-risk a mechanism in the IPF population. No translational gap exists."
+        ),
+    ),
+    "phase_2_clinical_trial": Model(
+        name="phase_2_clinical_trial",
+        score=1.0,
+        rationale=(
+            "Phase II clinical trial in human IPF patients. Measures drug effects — "
+            "pharmacodynamic biomarkers, exploratory efficacy endpoints, safety — "
+            "directly in the target population. Evidence is generated in living IPF "
+            "patients under controlled conditions, eliminating species and model "
+            "translation barriers. Score equals Phase III because the biological "
+            "context (human disease) is identical; statistical power and regulatory "
+            "weight differ but translational relevance does not."
+        ),
+    ),
+    "phase_1_clinical_trial": Model(
+        name="phase_1_clinical_trial",
+        score=1.0,
+        rationale=(
+            "Phase I dose-escalation or safety study in human subjects (patients or "
+            "healthy volunteers). Even early-phase clinical data confirm "
+            "pharmacokinetics, target engagement, and tolerability in humans — "
+            "evidence categories that preclinical models cannot provide. The "
+            "translational gap is zero by definition; the evidentiary gap vs. later "
+            "phases is captured by study_design scoring, not model scoring."
+        ),
+    ),
+    "human_biopsy_scrnaseq": Model(
         name="human_biopsy_scrnaseq",
         score=1.0,
         rationale=(
@@ -60,7 +98,7 @@ PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
             "Directly reflects the biology any therapeutic must engage."
         ),
     ),
-    "human_explant_pcls": PreclinicalModel(
+    "human_explant_pcls": Model(
         name="human_explant_pcls",
         score=0.95,
         rationale=(
@@ -71,7 +109,7 @@ PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
             "ex vivo culture artifacts and loss of systemic signals."
         ),
     ),
-    "primary_human_fibroblasts": PreclinicalModel(
+    "primary_human_fibroblasts": Model(
         name="primary_human_fibroblasts",
         score=0.75,
         rationale=(
@@ -81,7 +119,7 @@ PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
             "mechanistic dissection of fibroblast-intrinsic pathways."
         ),
     ),
-    "ipsc_derived": PreclinicalModel(
+    "ipsc_derived": Model(
         name="ipsc_derived",
         score=0.65,
         rationale=(
@@ -91,7 +129,7 @@ PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
             "microenvironment is not recapitulated without co-culture systems."
         ),
     ),
-    "humanized_mouse": PreclinicalModel(
+    "humanized_mouse": Model(
         name="humanized_mouse",
         score=0.55,
         rationale=(
@@ -101,7 +139,7 @@ PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
             "standard murine models for immune-fibroblast crosstalk studies."
         ),
     ),
-    "bleomycin_mouse_chronic": PreclinicalModel(
+    "bleomycin_mouse_chronic": Model(
         name="bleomycin_mouse_chronic",
         score=0.45,
         rationale=(
@@ -112,7 +150,7 @@ PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
         ),
         flags=["poor_ipf_translation"],
     ),
-    "tgfb_overexpression": PreclinicalModel(
+    "tgfb_overexpression": Model(
         name="tgfb_overexpression",
         score=0.30,
         rationale=(
@@ -122,7 +160,7 @@ PRECLINICAL_MODELS: dict[str, PreclinicalModel] = {
             "and create an artificial signaling context not present in human IPF."
         ),
     ),
-    "bleomycin_mouse_acute": PreclinicalModel(
+    "bleomycin_mouse_acute": Model(
         name="bleomycin_mouse_acute",
         score=0.25,
         rationale=(
@@ -507,23 +545,23 @@ def get_model_score(model_name: str) -> float:
     conservative — unknown models have not been validated for IPF translatability.
 
     Args:
-        model_name: Canonical model identifier (key in PRECLINICAL_MODELS).
+        model_name: Canonical model identifier (key in MODELS).
 
     Returns:
         Score in [0, 1]. Higher = more translationally relevant to human IPF.
     """
-    model = PRECLINICAL_MODELS.get(model_name)
+    model = MODELS.get(model_name)
     return model.score if model is not None else UNKNOWN_MODEL_FALLBACK_SCORE
 
 
-def get_model(model_name: str) -> PreclinicalModel | None:
+def get_model(model_name: str) -> Model | None:
     """
-    Return the full PreclinicalModel entry, or None if not recognized.
+    Return the full Model entry, or None if not recognized.
 
     Prefer this over get_model_score() when evaluators need flags or rationale
     for logging and auditable scoring decisions.
     """
-    return PRECLINICAL_MODELS.get(model_name)
+    return MODELS.get(model_name)
 
 
 def has_flag(model_name: str, flag: str) -> bool:
@@ -535,5 +573,5 @@ def has_flag(model_name: str, flag: str) -> bool:
 
     Returns False for unrecognized models rather than raising.
     """
-    model = PRECLINICAL_MODELS.get(model_name)
+    model = MODELS.get(model_name)
     return flag in model.flags if model is not None else False

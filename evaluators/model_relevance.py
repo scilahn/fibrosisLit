@@ -1,13 +1,14 @@
 """
-model_relevance.py — Detect preclinical model systems in paper text and score
-translational relevance to human IPF using the model hierarchy from fibrosis_priors.
+model_relevance.py — Detect model systems in paper text and score translational
+relevance to human IPF using the model hierarchy from fibrosis_priors.
 
 Detection is keyword/regex-based: fast, deterministic, and auditable. No LLM
-inference is used here; the biology is encoded in fibrosis_priors.PRECLINICAL_MODELS.
+inference is used here; the biology is encoded in fibrosis_priors.MODELS.
 
-Bleomycin acute patterns are checked last to avoid masking chronic variants —
-a paper describing "chronic bleomycin (42 days)" must not be mis-classified
-as acute simply because "bleomycin mouse" also matches.
+Clinical trial patterns are checked first so they score 1.0. Bleomycin acute
+patterns are checked last to avoid masking chronic variants — a paper describing
+"chronic bleomycin (42 days)" must not be mis-classified as acute simply because
+"bleomycin mouse" also matches.
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ import re
 from dataclasses import dataclass, field
 
 from domain_knowledge.fibrosis_priors import (
-    PRECLINICAL_MODELS,
+    MODELS,
     UNKNOWN_MODEL_FALLBACK_SCORE,
     get_model,
     get_model_score,
@@ -26,12 +27,32 @@ from domain_knowledge.fibrosis_priors import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Detection patterns — ordered: chronic before acute to prevent false positives.
+# Detection patterns — ordered highest-evidence first.
+# Clinical trials are checked first (score = 1.0). Within preclinical models,
+# chronic bleomycin is checked before acute to prevent false positives.
 # Each entry: (canonical_model_key, [regex_patterns]).
 # Patterns are matched case-insensitively against title + abstract.
 # ---------------------------------------------------------------------------
 
 MODEL_PATTERNS: list[tuple[str, list[str]]] = [
+    ("phase_3_clinical_trial", [
+        r"\bphase[ -]?3\b.{0,60}(trial|study|RCT)",
+        r"\bphase[ -]?III\b.{0,60}(trial|study|RCT)",
+        r"(randomized|randomised).{0,30}(phase[ -]?3|phase[ -]?III)",
+        r"(FIBRONEER|INBUILD|TOMORROW|CAPACITY|ASCEND).{0,30}(trial|study)",
+    ]),
+    ("phase_2_clinical_trial", [
+        r"\bphase[ -]?2\b.{0,60}(trial|study|RCT)",
+        r"\bphase[ -]?II\b.{0,60}(trial|study|RCT)",
+        r"(randomized|randomised).{0,30}(phase[ -]?2|phase[ -]?II)",
+        r"(INTEGRIS|FIBRONEER|ISABELA|ZEPHYR).{0,30}(trial|study)",
+    ]),
+    ("phase_1_clinical_trial", [
+        r"\bphase[ -]?1\b.{0,60}(trial|study|dose.escalation|first.in.human)",
+        r"\bphase[ -]?I\b.{0,60}(trial|study|dose.escalation|first.in.human)",
+        r"first.in.human.{0,30}(IPF|fibrosis|pulmonary)",
+        r"dose.escalation.{0,30}(IPF|fibrosis|pulmonary)",
+    ]),
     ("human_biopsy_scrnaseq", [
         r"(single.cell|snRNA.seq|scRNA.seq).{0,40}(human|patient|IPF|biopsy)",
         r"(human|patient|IPF).{0,20}biopsy.{0,20}single.cell",
@@ -78,7 +99,7 @@ class ModelRelevanceResult:
 
     detected_models are ordered by their position in MODEL_PATTERNS (highest-
     confidence human models first). primary_model is the one with the highest
-    translational relevance score from PRECLINICAL_MODELS — not necessarily
+    translational relevance score from MODELS — not necessarily
     the first detected, since a paper may use both human biopsies and bleomycin
     mice, and we want to score it by its strongest evidence system.
     """
