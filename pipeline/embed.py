@@ -47,7 +47,7 @@ SPECTER2_ADAPTER_NAME = "proximity"
 CHROMA_DIR = os.getenv("CHROMA_DIR", "./chroma_db")
 CHROMA_COLLECTION = os.getenv("CHROMA_COLLECTION", "fibrosis_papers")
 
-S3_BUCKET = os.getenv("S3_BUCKET_NAME", "fibrosislens-papers")
+S3_BUCKET = os.getenv("S3_BUCKET_NAME", "fibrosislit-papers")
 S3_SNAPSHOT_PREFIX = "chroma_snapshots/"
 
 # SPECTER2 max token length
