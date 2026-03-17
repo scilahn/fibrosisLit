@@ -44,8 +44,8 @@ CONTESTED_PATTERNS: dict[str, list[str]] = {
         r"epithelial.to.mesenchymal",
     ],
     "fibrosis_resolution_capacity": [
-        r"fibrosis.{0,15}(resolv|resolution|regression|reversal|reversib)",
-        r"(resolv|reversal).{0,15}fibrosis",
+        r"fibrosis.{0,40}(resolv|resolution|regression|reversal|reversib)",
+        r"(resolv|resolution|reversal).{0,40}fibrosis",
     ],
 }
 
