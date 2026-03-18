@@ -36,7 +36,8 @@ STUDY_DESIGN_TIERS: list[tuple[str, float, list[str]]] = [
         r"NCT\d{8}",
     ]),
     ("single_cell_human", 0.90, [
-        r"(scRNA.seq|snRNA.seq).{0,30}(IPF|patient|human|biopsy)",
+        r"(single.cell|scRNA.seq|snRNA.seq).{0,200}(IPF|patient|human|biopsy)",  # widened; added single-cell
+        r"(IPF|patient|human|biopsy).{0,200}(single.cell|scRNA.seq|snRNA.seq)",  # reverse direction
     ]),
     ("human_cohort", 0.85, [
         r"\b\d+\s+patients?\b",

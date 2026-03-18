@@ -54,7 +54,8 @@ MODEL_PATTERNS: list[tuple[str, list[str]]] = [
         r"dose.escalation.{0,30}(IPF|fibrosis|pulmonary)",
     ]),
     ("human_biopsy_scrnaseq", [
-        r"(single.cell|snRNA.seq|scRNA.seq).{0,40}(human|patient|IPF|biopsy)",
+        r"(single.cell|snRNA.seq|scRNA.seq).{0,200}(human|patient|IPF|biopsy)",   # widened from 40
+        r"(human|patient|IPF|biopsy).{0,200}(single.cell|scRNA.seq|snRNA.seq)",   # reverse direction
         r"(human|patient|IPF).{0,20}biopsy.{0,20}single.cell",
     ]),
     ("human_explant_pcls", [
