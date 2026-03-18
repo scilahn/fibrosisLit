@@ -54,8 +54,10 @@ STUDY_DESIGN_TIERS: list[tuple[str, float, list[str]]] = [
         r"primary.{0,10}(alveolar|bronchial)",
     ]),
     ("animal_model", 0.50, [
-        r"(mouse|mice|murine|rat).{0,20}(bleomycin|fibrosis|model)",
+        r"(mouse|mice|murine|rat).{0,30}(bleomycin|fibrosis|model)",  # widened from {0,20}
+        r"(bleomycin|fibrosis|model).{0,30}(mouse|mice|murine|rat)",  # reverse direction
         r"(in vivo).{0,20}(fibrosis|IPF)",
+        r"\bBLM\b.{0,20}(mouse|mice|murine|rat)",                     # BLM abbreviation
     ]),
     ("cell_line", 0.30, [
         r"\bcell line\b",

@@ -80,6 +80,7 @@ MODEL_PATTERNS: list[tuple[str, list[str]]] = [
         r"chronic bleomycin",
         r"repeated bleomycin",
         r"bleomycin.{0,5}(28|35|42|56).?day",
+        r"(mouse|mice|murine|rat).{0,30}chronic.{0,10}bleomycin",
     ]),
     ("tgfb_overexpression", [
         r"TGF.?[bβ].{0,10}(transgenic|overexpression|overexpressing)",
@@ -87,7 +88,10 @@ MODEL_PATTERNS: list[tuple[str, list[str]]] = [
     ]),
     ("bleomycin_mouse_acute", [   # checked last — fallback for any bleomycin+animal hit
         r"bleomycin.{0,30}(mouse|mice|murine|rat)",
+        r"(mouse|mice|murine|rat).{0,30}bleomycin",  # reverse: "mice were treated with bleomycin"
         r"(intratracheal|i\.t\.).{0,10}bleomycin",
+        r"\bBLM\b.{0,10}(mouse|mice|murine|rat)",    # BLM abbreviation
+        r"(mouse|mice|murine|rat).{0,10}\bBLM\b",    # BLM reverse
     ]),
 ]
 
