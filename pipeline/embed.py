@@ -247,7 +247,7 @@ def query(
     query_args: dict[str, Any] = {
         "query_embeddings": embeddings,
         "n_results": n_results,
-        "include": ["metadatas", "distances"],
+        "include": ["metadatas", "distances", "documents"],
     }
     if where:
         query_args["where"] = where
@@ -255,10 +255,13 @@ def query(
     results = collection.query(**query_args)
 
     output: list[dict[str, Any]] = []
-    for meta, dist in zip(
-        results["metadatas"][0], results["distances"][0]
+    for meta, dist, doc in zip(
+        results["metadatas"][0], results["distances"][0], results["documents"][0]
     ):
-        output.append({**meta, "distance": dist})
+        # Documents were stored as "title [SEP] abstract"; recover the abstract.
+        parts = doc.split(" [SEP] ", 1)
+        abstract = parts[1].strip() if len(parts) == 2 else ""
+        output.append({**meta, "distance": dist, "abstract": abstract})
 
     return output
 

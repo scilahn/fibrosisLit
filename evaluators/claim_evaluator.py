@@ -444,7 +444,7 @@ def _score_retrieved_papers(papers: list[dict], disease: str) -> list[dict]:
         paper_dict = {
             "pmid":     p.get("pmid", ""),
             "title":    p.get("title", ""),
-            "abstract": "",   # not available from embed.query()
+            "abstract": p.get("abstract", ""),  # recovered from ChromaDB documents field
             "journal":  p.get("journal", ""),
             "pub_date": p.get("pub_date", ""),
         }
@@ -460,6 +460,7 @@ def _score_retrieved_papers(papers: list[dict], disease: str) -> list[dict]:
             # From embed.query()
             "pmid":             p.get("pmid", ""),
             "title":            p.get("title", ""),
+            "abstract":         p.get("abstract", ""),
             "journal":          p.get("journal", ""),
             "pub_date":         p.get("pub_date", ""),
             "doi":              p.get("doi", ""),
@@ -483,19 +484,23 @@ def _format_evidence_block(scored_papers: list[dict]) -> str:
     """Format scored papers into the evidence context block for the LLM prompt."""
     lines: list[str] = []
     for i, p in enumerate(scored_papers, start=1):
-        pathways_str   = ", ".join(p["detected_pathways"])  or "none detected"
-        models_str     = ", ".join(p["detected_models"])    or "none"
-        flags_str      = ", ".join(p["contested_flags"])    or "none"
-        warnings_str   = ", ".join(p["model_warnings"])     or "none"
+        pathways_str  = ", ".join(p["detected_pathways"]) or "none detected"
+        models_str    = ", ".join(p["detected_models"])   or "none"
+        flags_str     = ", ".join(p["contested_flags"])   or "none"
+        warnings_str  = ", ".join(p["model_warnings"])    or "none"
+        abstract_str  = (p.get("abstract") or "").strip()
+        abstract_line = f"\n    Abstract: {abstract_str[:400]}" if abstract_str else ""
         lines.append(
             f"[{i}] PMID {p['pmid']} | {p['title']}\n"
             f"    Journal: {p['journal']} ({p['pub_date']})\n"
             f"    Evidence score: {p['overall_score']:.2f} | "
             f"Study design: {p['study_design_tier']} | "
             f"Retrieval distance: {p['distance']:.4f}\n"
+            f"    Detected models: {models_str}\n"
             f"    Pathways: {pathways_str}\n"
             f"    Model flags: {warnings_str}\n"
             f"    Contested flags: {flags_str}"
+            f"{abstract_line}"
         )
     return "\n\n".join(lines)
 
