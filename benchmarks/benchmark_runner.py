@@ -48,22 +48,32 @@ RESULTS_DIR = pathlib.Path(__file__).parent / "results"
 # One query per claim-domain cluster, covering all 25 benchmark claims.
 # Each string is passed through make_mesh_query() before PubMed search.
 _SEED_QUERIES: list[str] = [
-    # WS-01, WS-05, CT-01, CT-02 — macrophage / fibroblast single-cell
-    "SPP1 macrophage myofibroblast CTHRC1 fibroblast single-cell atlas",
-    # WS-02, WS-03, WS-06 — integrin / TGF-β / SMAD axis
-    "TGF-beta SMAD integrin avb6 avb1 bexotegrast latent activation",
-    # WS-04, WS-08, OC-06 — approved drugs / clinical trials / PDE4
-    "nerandomilast nintedanib PDE4 FIBRONEER clinical trial FVC",
+    # WS-01, WS-05, CT-01, CT-02 — macrophage / myofibroblast
+    "SPP1 macrophage myofibroblast",
+    # WS-02 — CTHRC1 fibroblast
+    "CTHRC1 fibroblast",
+    # WS-03, WS-06 — integrin / TGF-β
+    "TGF-beta SMAD integrin",
+    # WS-04 — bexotegrast / integrin
+    "bexotegrast integrin",
+    # WS-08, OC-06 — nerandomilast / PDE4
+    "nerandomilast PDE4",
+    # WS-08 — nintedanib clinical trial
+    "nintedanib clinical trial",
     # WS-07, CT-03 — aberrant basaloid / EMT
-    "aberrant basaloid KRT17 epithelial mesenchymal transition",
-    # CT-04, CT-07, OC-04 — IL-13 / autotaxin / ATX
-    "IL-13 autotaxin ATX LPA fibrosis progression",
-    # CT-05, CT-06, OC-01, OC-03, OC-07 — bleomycin model / fibrosis resolution
-    "bleomycin mouse model fibrosis resolution regression",
-    # OC-02 — CSF1R / macrophage therapy
-    "CSF1R M-CSF macrophage colony stimulating factor therapy",
-    # OC-05 — liver fibrosis cross-organ
-    "liver fibrosis resolution reversal cross-organ applicability",
+    "aberrant basaloid KRT17",
+    # CT-04, OC-04 — IL-13 / autotaxin
+    "IL-13 autotaxin fibrosis",
+    # CT-07 — LPA fibrosis
+    "LPA fibrosis",
+    # CT-05, CT-06, OC-01, OC-03, OC-07 — bleomycin model
+    "bleomycin fibrosis",
+    # OC-01 — nintedanib bleomycin
+    "nintedanib bleomycin",
+    # OC-02 — CSF1R macrophage
+    "CSF1R macrophage",
+    # OC-05 — liver fibrosis
+    "liver fibrosis resolution",
 ]
 
 
