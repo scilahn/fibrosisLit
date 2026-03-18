@@ -51,6 +51,7 @@ CSV_COLUMNS: list[str] = [
     "claim_id", "tier", "claim", "expected_verdict", "actual_verdict", "correct",
     "pathway_support_score", "model_penalty", "prior_support_score",
     "contested_flags", "model_warnings",
+    "llm_verdict", "verdict", "verdict_confidence",
 ]
 
 
@@ -104,6 +105,14 @@ def _result_to_json_row(
         "contested_flags":       [_flag_to_dict(f) for f in result.contested_flags],
         "warnings":              result.warnings,
         "rationale":             result.rationale,
+        # Two-vote fields (present when LLM vote ran)
+        "llm_verdict":           result.llm_verdict,
+        "llm_confidence":        result.llm_confidence,
+        "llm_reasoning":         result.llm_reasoning,
+        "verdict":               result.verdict,
+        "verdict_confidence":    result.verdict_confidence,
+        "verdict_rationale":     result.verdict_rationale,
+        "references":            result.references,
     }
 
 
@@ -125,6 +134,9 @@ def _result_to_csv_row(
         "prior_support_score":   f"{result.prior_support_score:.3f}",
         "contested_flags":       ";".join(f.debate_name for f in result.contested_flags),
         "model_warnings":        ";".join(result.warnings),
+        "llm_verdict":           result.llm_verdict or "N/A",
+        "verdict":               result.verdict,
+        "verdict_confidence":    result.verdict_confidence,
     }
 
 

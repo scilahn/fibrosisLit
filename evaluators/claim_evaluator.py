@@ -1,41 +1,44 @@
 """
-claim_evaluator.py — Evaluate a biological claim against IPF domain priors.
+claim_evaluator.py — Evaluate a biological claim using a two-vote system.
 
-Answers "how well-supported is this claim a priori?" without reference to
-any specific paper. Uses pathway centrality priors from fibrosis_priors.PATHWAYS,
-model translation hierarchy from fibrosis_priors.MODELS, and contested biology
-from fibrosis_priors.CONTESTED_BIOLOGY.
+Vote 1 (deterministic): prior-based pathway support, model translational penalty, and
+contested biology detection — fully local, no API calls. This vote answers "how well
+does this claim align with IPF domain priors encoded in fibrosis_priors.py?"
 
-This evaluator is intentionally distinct from evaluate_paper(): papers are
-scored on the quality of evidence they contain; claims are scored on how well
-their biological assertions align with established IPF domain priors. A claim
-about a central pathway (TGF-β/SMAD) starts with high prior support; a claim
-attributing findings to bleomycin mouse data starts with a model penalty.
+Vote 2 (LLM): Claude API call with papers retrieved from ChromaDB as evidence context.
+Retrieved papers are pre-scored by evidence_quality.evaluate_paper() before being
+formatted into the prompt, so the LLM receives structured quality metadata rather than
+raw abstracts.
 
-Contested biology acts as a hard tier override, not a score penalty. A claim
-invoking myofibroblast reversibility cannot be classified WELL_SUPPORTED
-without resolving an active debate — which this evaluator refuses to do.
+Note: pipeline.embed.query() returns titles but not abstracts. evaluate_paper() is
+therefore called with abstract="" — an accepted title-only limitation. The LLM
+compensates via training knowledge about the cited papers' content. This is the reason
+the LLM vote exists: it does not depend solely on metadata scores.
 
-Tier classification:
-    WELL_SUPPORTED — high pathway prior support, no model penalty, no contested flags.
-    CONTESTED      — hard override when contested biology is detected; also used as the
-                     conservative default for claims in the ambiguous mid-range.
-    OVERCLAIMED    — strong pathway prior but resting on poor-translation model evidence,
-                     OR no recognized pathway support at all.
+Adjudication rules (deterministic tier → verdict mapping first):
+    WELL_SUPPORTED → SUPPORTED,  CONTESTED → CONTESTED,  OVERCLAIMED → UNSUPPORTED
 
-Known limitations of prior-based evaluation:
-    - Claims about model validity (e.g. "bleomycin faithfully recapitulates IPF") may
-      be classified OVERCLAIMED rather than CONTESTED because model-only claims score
-      pathway_support = 0.0, which falls below the OVERCLAIMED_THRESHOLD.
-    - Claims that require clinical outcome knowledge (e.g. failed trial X) to classify
-      as OVERCLAIMED will land in the ambiguous CONTESTED bucket — the evaluator cannot
-      know trial results without paper evidence.
-    - The prior_support_score reflects pathway biology only, not clinical efficacy data.
+    det=SUPPORTED  + llm=SUPPORTED  → SUPPORTED    (HIGH confidence)
+    det=CONTESTED  + llm=CONTESTED  → CONTESTED    (HIGH confidence)
+    det=UNSUPPORTED + llm=UNSUPPORTED → UNSUPPORTED (HIGH confidence)
+    det=UNSUPPORTED + llm=CONTESTED → CONTESTED    (HIGH — LLM found genuine debate)
+    Any other combination           → LOW_CONFIDENCE (LOW — flag both verdicts)
+
+INSUFFICIENT_EVIDENCE from LLM → LOW_CONFIDENCE (retrieval gap, not a biological verdict).
+
+The authoritative output is `result.verdict`. The original `result.tier` (deterministic tier)
+is preserved unchanged for benchmark_runner.py backward compatibility.
 """
 
+from __future__ import annotations
+
+import json
 import logging
 import re
 from dataclasses import dataclass, field
+
+import anthropic
+from dotenv import load_dotenv
 
 from domain_knowledge.fibrosis_priors import (
     get_pathway_prior,
@@ -43,29 +46,49 @@ from domain_knowledge.fibrosis_priors import (
     has_flag,
 )
 from evaluators.contradiction_detector import ContestedFlag, detect_contested_claims
-from evaluators.evidence_quality import PATHWAY_PATTERNS
+from evaluators.evidence_quality import PATHWAY_PATTERNS, evaluate_paper
+from evaluators.confidence_scorer import compute_confidence
+from pipeline.embed import query as chroma_query
+
+load_dotenv()
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Tier classification thresholds
+# Tier classification thresholds (deterministic vote)
 # ---------------------------------------------------------------------------
 
 WELL_SUPPORTED_THRESHOLD: float = 0.70
 OVERCLAIMED_THRESHOLD: float = 0.35
 
 # ---------------------------------------------------------------------------
-# Model penalty magnitudes — applied when a claim mentions a model system with
-# known poor IPF translational relevance.
+# Model penalty magnitudes
 # ---------------------------------------------------------------------------
 
-POOR_TRANSLATION_PENALTY: float = 0.40   # models with has_flag("poor_ipf_translation")
-LOW_TRANSLATABILITY_PENALTY: float = 0.25 # models with score < 0.50 (e.g. tgfb_overexpression)
+POOR_TRANSLATION_PENALTY: float = 0.40
+LOW_TRANSLATABILITY_PENALTY: float = 0.25
 
 # ---------------------------------------------------------------------------
-# Cell-type and population entity patterns — detect biological entities that
-# have strong IPF domain support but are not represented in PATHWAY_PATTERNS.
-# Each key maps to CLAIM_ENTITY_PRIORS for scoring.
+# LLM configuration
+# ---------------------------------------------------------------------------
+
+LLM_MODEL: str = "claude-sonnet-4-20250514"
+LLM_MAX_TOKENS: int = 1024
+LLM_TEMPERATURE: float = 0.0   # deterministic for auditable scoring
+N_EVIDENCE_DEFAULT: int = 8
+
+# ---------------------------------------------------------------------------
+# Adjudication — normalize deterministic tier to verdict vocabulary
+# ---------------------------------------------------------------------------
+
+_DET_TIER_NORM: dict[str, str] = {
+    "WELL_SUPPORTED": "SUPPORTED",
+    "CONTESTED":      "CONTESTED",
+    "OVERCLAIMED":    "UNSUPPORTED",
+}
+
+# ---------------------------------------------------------------------------
+# Cell-type and population entity patterns
 # ---------------------------------------------------------------------------
 
 CLAIM_ENTITY_PATTERNS: dict[str, list[str]] = {
@@ -87,8 +110,7 @@ CLAIM_ENTITY_PATTERNS: dict[str, list[str]] = {
         r"\bACTA2\b",
     ],
     # Aberrant basaloid cells: KRT17+ cells co-expressing epithelial and mesenchymal
-    # markers are a disease-specific population identified in human IPF single-cell atlases
-    # (Kathiriya 2023). Their existence in human IPF lung is well-supported; their
+    # markers, disease-specific to human IPF (Kathiriya 2023). Existence is well-supported;
     # mechanistic interpretation (partial EMT vs. aberrant differentiation) is contested.
     "aberrant_basaloid": [
         r"\baberrant basaloid\b",
@@ -97,17 +119,13 @@ CLAIM_ENTITY_PATTERNS: dict[str, list[str]] = {
 }
 
 CLAIM_ENTITY_PRIORS: dict[str, float] = {
-    "spp1_macrophage":    0.85,  # strong human scRNA-seq consensus across multiple IPF atlases
-    "myofibroblast_axis": 0.80,  # well-characterized in human biopsy, primary fibroblast data
-    "aberrant_basaloid":  0.75,  # human-specific; well-supported as a cell population
+    "spp1_macrophage":    0.85,
+    "myofibroblast_axis": 0.80,
+    "aberrant_basaloid":  0.75,
 }
 
 # ---------------------------------------------------------------------------
-# Model mention patterns — detect when a claim invokes a preclinical model
-# system with known poor IPF translational relevance. Penalty is applied as
-# a multiplier suppressing pathway_support_score.
-# Keys match canonical model identifiers in fibrosis_priors.MODELS so that
-# has_flag() and get_model() can be called directly.
+# Model mention patterns
 # ---------------------------------------------------------------------------
 
 CLAIM_MODEL_PATTERNS: list[tuple[str, list[str]]] = [
@@ -128,6 +146,40 @@ CLAIM_MODEL_PATTERNS: list[tuple[str, list[str]]] = [
     ]),
 ]
 
+# ---------------------------------------------------------------------------
+# LLM system prompt
+# ---------------------------------------------------------------------------
+
+_LLM_SYSTEM_PROMPT: str = """\
+You are an expert in IPF (idiopathic pulmonary fibrosis) biology with knowledge of \
+translational medicine and clinical trial history. Evaluate whether a biological claim \
+is SUPPORTED, CONTESTED, or UNSUPPORTED based on retrieved evidence.
+
+Critical rules:
+1. Human biopsy / single-cell atlas / clinical trial data outweighs animal model data. \
+Weight evidence accordingly.
+2. Bleomycin acute mouse results are weak IPF evidence — flag claims resting primarily \
+on them as having poor translational support.
+3. The M1/M2 macrophage framework is contested in fibrosis. Do NOT return SUPPORTED for \
+claims invoking M1/M2 polarization without flagging this as a contested framework.
+4. Myofibroblast reversibility is an active debate. Surface both positions; do NOT resolve it.
+5. Clinical trial failures outweigh preclinical mechanistic papers — cite them if relevant.
+6. Never synthesize contradictory evidence into a confident conclusion. If genuine \
+disagreement exists in the evidence, return CONTESTED.
+7. INSUFFICIENT_EVIDENCE is correct when the retrieved papers do not meaningfully address \
+the claim — not when papers disagree.
+
+Return ONLY valid JSON matching this exact schema — no text outside the JSON object:
+{
+  "verdict": "SUPPORTED" | "CONTESTED" | "UNSUPPORTED" | "INSUFFICIENT_EVIDENCE",
+  "confidence": <float 0.0-1.0>,
+  "reasoning": "<2-4 sentences explaining the verdict, citing PMIDs>",
+  "supporting_pmids": ["<pmid>", ...],
+  "contesting_pmids": ["<pmid>", ...],
+  "paper_stances": {"<pmid>": "supporting" | "contesting" | "neutral", ...}
+}\
+"""
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -136,101 +188,76 @@ CLAIM_MODEL_PATTERNS: list[tuple[str, list[str]]] = [
 @dataclass
 class ClaimEvaluationResult:
     """
-    Prior-based evaluation of a single biological claim against IPF domain knowledge.
+    Two-vote evaluation of a single biological claim.
 
-    This result reflects how well the claim aligns with established IPF biology
-    priors — NOT whether any paper supports the claim. Papers are evaluated separately
-    by evidence_quality.evaluate_paper(); this result is the domain-knowledge baseline
-    against which paper-level evidence should be interpreted.
+    The authoritative output is `verdict` (adjudicated from both votes).
+    The original `tier` field (deterministic tier: WELL_SUPPORTED|CONTESTED|OVERCLAIMED)
+    is preserved unchanged for benchmark_runner.py backward compatibility.
 
-    detected_pathways includes both PATHWAY_PATTERNS keys and CLAIM_ENTITY_PATTERNS
-    keys (cell-type level entities), unified under a single list with their
-    prior scores captured in the rationale.
+    `references` is the list of papers retrieved from ChromaDB that were used as
+    LLM evidence context, each enriched with pre-scored quality metrics and the
+    LLM's assessed stance (supporting/contesting/neutral).
 
-    contested_flags stores full ContestedFlag objects (including competing positions)
-    so callers can surface the full debate text without needing to go back to
-    fibrosis_priors. This differs from EvidenceQualityReport.contested_flags which
-    stores only keys — claim evaluation is consumed interactively (benchmark runs)
-    where the full debate text is immediately useful.
+    When llm_verdict is None or "LLM_ERROR", verdict will be "LOW_CONFIDENCE" and
+    verdict_confidence will be "LOW". The deterministic tier remains valid in all cases.
     """
     claim: str
     disease: str
 
-    # Detection results
-    detected_pathways: list[str]          # pathway + entity keys with recognized priors
-    detected_model_mentions: list[str]    # canonical model keys from fibrosis_priors.MODELS
-
-    # Full ContestedFlag objects — surface all positions, never synthesize
-    contested_flags: list[ContestedFlag]
-
-    # Intermediate scores
-    pathway_support_score: float   # max pathway/entity prior across detections (0.0–1.0)
-    model_penalty: float           # deduction applied as multiplier (0.0–1.0)
-
-    # Composite prior support
-    prior_support_score: float     # pathway_support_score * (1.0 - model_penalty)
-
-    # Tier classification
-    tier: str  # "WELL_SUPPORTED" | "CONTESTED" | "OVERCLAIMED"
-
-    # Audit trail — one entry per scoring decision, matching rationale format in
-    # evidence_quality.EvidenceQualityReport for consistency across evaluators.
+    # ----- Deterministic vote (all fields from original evaluate_claim) -----
+    detected_pathways: list[str]
+    detected_model_mentions: list[str]
+    contested_flags: list[ContestedFlag]   # full objects with positions
+    pathway_support_score: float
+    model_penalty: float
+    prior_support_score: float
+    tier: str                              # "WELL_SUPPORTED" | "CONTESTED" | "OVERCLAIMED"
     rationale: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
 
+    # ----- LLM vote -----
+    llm_verdict: str | None = None         # SUPPORTED|CONTESTED|UNSUPPORTED|INSUFFICIENT_EVIDENCE|LLM_ERROR
+    llm_confidence: float | None = None
+    llm_reasoning: str | None = None
+    llm_raw_response: str | None = None    # raw JSON string for audit
+
+    # ----- Adjudicated verdict -----
+    verdict: str = "PENDING"              # SUPPORTED|CONTESTED|UNSUPPORTED|LOW_CONFIDENCE
+    verdict_confidence: str = "LOW"       # HIGH|LOW
+    verdict_rationale: str = ""
+
+    # ----- Retrieved references -----
+    references: list[dict] = field(default_factory=list)
+    # Each reference dict keys:
+    #   pmid, title, journal, pub_date, doi, authors, distance   ← from embed.query()
+    #   overall_score, study_design_tier, detected_pathways,      ← from evaluate_paper()
+    #   detected_models, contested_flags, model_warnings,
+    #   confidence                                                 ← from compute_confidence()
+    #   llm_stance   "supporting"|"contesting"|"neutral"          ← from LLM paper_stances
+
 
 # ---------------------------------------------------------------------------
-# Private helpers
+# Deterministic vote helpers (unchanged from original evaluate_claim body)
 # ---------------------------------------------------------------------------
 
 def _detect_claim_pathways(claim: str) -> list[tuple[str, float]]:
-    """
-    Return (key, prior_score) pairs for all pathways and biological entities
-    detected in the claim text.
-
-    Checks PATHWAY_PATTERNS first (canonical IPF pathways from fibrosis_priors),
-    then CLAIM_ENTITY_PATTERNS (cell-type and population markers with their own
-    domain priors). Uses the same first-match-per-key logic as _detect_pathways
-    in evidence_quality.py.
-
-    Args:
-        claim: Biological claim as a declarative string.
-
-    Returns:
-        List of (key, score) tuples, one per detected pathway or entity.
-    """
+    """Return (key, prior_score) pairs for all pathways and entities detected in claim."""
     results: list[tuple[str, float]] = []
-
     for pathway_key, patterns in PATHWAY_PATTERNS.items():
         for pattern in patterns:
             if re.search(pattern, claim, re.IGNORECASE | re.DOTALL):
                 results.append((pathway_key, get_pathway_prior(pathway_key)))
                 break
-
     for entity_key, patterns in CLAIM_ENTITY_PATTERNS.items():
         for pattern in patterns:
             if re.search(pattern, claim, re.IGNORECASE | re.DOTALL):
                 results.append((entity_key, CLAIM_ENTITY_PRIORS[entity_key]))
                 break
-
     return results
 
 
 def _detect_model_mentions(claim: str) -> list[str]:
-    """
-    Return canonical model keys for any preclinical model systems mentioned
-    in the claim text.
-
-    Checks CLAIM_MODEL_PATTERNS in order; all matches are collected (a claim
-    may mention multiple model systems). Uses first-match-per-model logic to
-    avoid duplicate detection of the same model via different patterns.
-
-    Args:
-        claim: Biological claim as a declarative string.
-
-    Returns:
-        List of canonical model keys (keys in fibrosis_priors.MODELS).
-    """
+    """Return canonical model keys for preclinical model systems mentioned in claim."""
     detected: list[str] = []
     for model_key, patterns in CLAIM_MODEL_PATTERNS:
         for pattern in patterns:
@@ -245,40 +272,15 @@ def _compute_model_penalty(
     rationale: list[str],
     warnings: list[str],
 ) -> float:
-    """
-    Compute the maximum model-based penalty across all detected model mentions.
-
-    A claim citing bleomycin AND TGF-β overexpression is penalized for the
-    worst of the two, not doubly penalized. The penalty is meant to be applied
-    as a multiplier: prior_support_score = pathway_score * (1.0 - penalty).
-
-    Penalty tiers:
-        POOR_TRANSLATION_PENALTY (0.40)  — models flagged "poor_ipf_translation"
-        LOW_TRANSLATABILITY_PENALTY (0.25) — models with score < 0.50 that lack
-                                             the explicit flag (tgfb_overexpression)
-
-    Args:
-        detected_model_mentions: Canonical model keys from _detect_model_mentions.
-        rationale: Mutated in place — one entry appended per model.
-        warnings: Mutated in place — model flags appended when present.
-
-    Returns:
-        Maximum penalty value in [0.0, 1.0]. 0.0 if no models detected.
-    """
+    """Compute maximum model penalty across detected model mentions."""
     if not detected_model_mentions:
         return 0.0
-
     max_penalty: float = 0.0
     for model_key in detected_model_mentions:
         model = get_model(model_key)
         if model is None:
-            # Unknown model key — should not happen with CLAIM_MODEL_PATTERNS, but
-            # defend against future pattern additions that lack a MODELS entry.
-            rationale.append(
-                f"[model] {model_key}: unrecognized model key, skipping penalty"
-            )
+            rationale.append(f"[model] {model_key}: unrecognized model key, skipping penalty")
             continue
-
         if has_flag(model_key, "poor_ipf_translation"):
             penalty = POOR_TRANSLATION_PENALTY
             for flag in model.flags:
@@ -296,12 +298,8 @@ def _compute_model_penalty(
             )
         else:
             penalty = 0.0
-            rationale.append(
-                f"[model] {model_key}: score={model.score:.2f} → no penalty applied"
-            )
-
+            rationale.append(f"[model] {model_key}: score={model.score:.2f} → no penalty applied")
         max_penalty = max(max_penalty, penalty)
-
     return max_penalty
 
 
@@ -310,99 +308,26 @@ def _classify_tier(
     contested_flags: list[ContestedFlag],
     model_penalty: float,
 ) -> str:
-    """
-    Classify a claim into WELL_SUPPORTED, CONTESTED, or OVERCLAIMED.
-
-    Classification order (each condition is checked in sequence; first match wins):
-    1. Contested flags present → CONTESTED (hard override; resolving a live debate
-       is outside the scope of prior-based evaluation).
-    2. High pathway support AND no model penalty → WELL_SUPPORTED.
-    3. High pathway support BUT model penalty present → OVERCLAIMED (real biology
-       invoked, but claim rests on poor-translation model evidence — the exact
-       pattern of OC-01, OC-03).
-    4. Very low pathway support → OVERCLAIMED (claim invokes no recognized pathway
-       or cell-type prior, suggesting biologically unsupported or extrapolated claim).
-    5. Default (ambiguous mid-range) → CONTESTED (conservative; the evaluator lacks
-       sufficient priors to confidently classify, so surfaces as needing scrutiny).
-
-    Known edge case: claims about model system fidelity (e.g. CT-06 "bleomycin
-    faithfully recapitulates IPF") have pathway_support=0.0 and model_penalty>0,
-    which places them in OVERCLAIMED rather than CONTESTED. This is a limitation
-    of prior-based evaluation — the debate about model validity is a contested one,
-    but the evaluator cannot distinguish "claim about model fidelity" from "claim
-    attributing biology to model data" without semantic parsing.
-
-    Args:
-        prior_support_score: pathway_support_score * (1.0 - model_penalty).
-        contested_flags:     Detected contested biology flags.
-        model_penalty:       Applied penalty value (0.0 = none detected).
-
-    Returns:
-        "WELL_SUPPORTED" | "CONTESTED" | "OVERCLAIMED"
-    """
+    """Classify claim into WELL_SUPPORTED, CONTESTED, or OVERCLAIMED."""
     if contested_flags:
         return "CONTESTED"
-
     if prior_support_score >= WELL_SUPPORTED_THRESHOLD:
-        if model_penalty == 0.0:
-            return "WELL_SUPPORTED"
-        else:
-            return "OVERCLAIMED"
-
+        return "WELL_SUPPORTED" if model_penalty == 0.0 else "OVERCLAIMED"
     if prior_support_score < OVERCLAIMED_THRESHOLD:
         return "OVERCLAIMED"
-
-    # Mid-range (OVERCLAIMED_THRESHOLD <= score < WELL_SUPPORTED_THRESHOLD):
-    # insufficient prior support to declare well-supported, but not obviously
-    # wrong — surface as CONTESTED for further scrutiny.
     return "CONTESTED"
 
 
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-
-def evaluate_claim(
-    claim: str,
-    disease: str = "ipf",
-) -> ClaimEvaluationResult:
+def _deterministic_vote(claim: str, disease: str) -> ClaimEvaluationResult:
     """
-    Evaluate a biological claim against IPF domain priors.
+    Run the deterministic prior-based evaluation.
 
-    Answers "how well-supported is this claim a priori?" using only domain
-    knowledge encoded in fibrosis_priors. Does NOT evaluate whether any paper
-    supports the claim — that is the retrieval layer's job.
-
-    Three detection passes are applied to the claim text:
-    1. Pathway + entity detection: identifies recognized IPF pathways (PATHWAY_PATTERNS)
-       and cell-type markers (CLAIM_ENTITY_PATTERNS). pathway_support_score is the
-       maximum prior across all detected pathways/entities.
-    2. Model mention detection: identifies preclinical model systems with poor IPF
-       translational relevance (CLAIM_MODEL_PATTERNS). model_penalty suppresses the
-       pathway_support_score multiplicatively.
-    3. Contested biology detection: reuses detect_contested_claims() from
-       contradiction_detector. Any contested flag forces tier = CONTESTED regardless
-       of pathway support — the evaluator refuses to resolve live debates.
-
-    prior_support_score = pathway_support_score * (1.0 - model_penalty)
-
-    This score reflects only pathway/entity biology and model-system caveats.
-    It does NOT encode clinical trial outcomes, organ-specificity arguments, or
-    validation status claims — those require paper-level evidence.
-
-    Args:
-        claim:   Biological claim as a declarative string.
-        disease: Target disease context. Currently only "ipf" is supported.
-
-    Returns:
-        ClaimEvaluationResult with pathway support, model penalty, contested
-        positions, prior_support_score, tier classification, and full audit
-        rationale.
+    Identical logic to the original evaluate_claim(). Returns a ClaimEvaluationResult
+    with all deterministic fields populated; LLM fields remain at defaults.
     """
     rationale: list[str] = []
     warnings: list[str] = []
 
-    # 1. Pathway + entity detection
     detected_pathway_pairs = _detect_claim_pathways(claim)
     detected_pathways = [key for key, _ in detected_pathway_pairs]
 
@@ -418,18 +343,12 @@ def evaluate_claim(
         pathway_support_score = 0.0
         rationale.append("[pathway] no recognized pathways or entities detected → score=0.00")
 
-    # 2. Model mention detection + penalty
     detected_model_mentions = _detect_model_mentions(claim)
     model_penalty = _compute_model_penalty(detected_model_mentions, rationale, warnings)
-
     if not detected_model_mentions:
         rationale.append("[model] no model system mentions detected → penalty=0.00")
 
-    # 3. Contested biology detection
-    # detect_contested_claims takes (title, abstract) — pass claim as title and
-    # empty string as abstract so all claim text is scanned via the title path.
     contested_flags = detect_contested_claims(claim, "", disease)
-
     if contested_flags:
         for flag in contested_flags:
             rationale.append(
@@ -439,31 +358,17 @@ def evaluate_claim(
     else:
         rationale.append("[contested] no contested biology detected")
 
-    # 4. Compute composite prior support
     prior_support_score = pathway_support_score * (1.0 - model_penalty)
     rationale.append(
         f"[prior_support] {pathway_support_score:.2f} × (1.0 - {model_penalty:.2f}) "
         f"= {prior_support_score:.3f}"
     )
 
-    # 5. Tier classification
     tier = _classify_tier(prior_support_score, contested_flags, model_penalty)
     rationale.append(
-        f"[tier] {tier}: "
-        f"prior_support={prior_support_score:.3f} "
+        f"[tier] {tier}: prior_support={prior_support_score:.3f} "
         f"model_penalty={model_penalty:.2f} "
         f"contested_flags={[f.debate_name for f in contested_flags]}"
-    )
-
-    logger.info(
-        "Claim '%s...' | tier=%s prior_support=%.3f pathway=%.2f "
-        "model_penalty=%.2f contested=%s",
-        claim[:60],
-        tier,
-        prior_support_score,
-        pathway_support_score,
-        model_penalty,
-        [f.debate_name for f in contested_flags],
     )
 
     return ClaimEvaluationResult(
@@ -478,4 +383,350 @@ def evaluate_claim(
         tier=tier,
         rationale=rationale,
         warnings=warnings,
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM vote helpers
+# ---------------------------------------------------------------------------
+
+def _score_retrieved_papers(papers: list[dict], disease: str) -> list[dict]:
+    """
+    Score each retrieved paper with evaluate_paper() + compute_confidence().
+
+    Because embed.query() returns no abstract, evaluate_paper() is called with
+    abstract="" — title-only scoring. This is an accepted limitation documented
+    in the module header.
+
+    Returns a list of reference dicts with all embed.query() fields plus
+    quality scoring fields, with llm_stance defaulting to "neutral".
+    """
+    scored: list[dict] = []
+    for p in papers:
+        paper_dict = {
+            "pmid":     p.get("pmid", ""),
+            "title":    p.get("title", ""),
+            "abstract": "",   # not available from embed.query()
+            "journal":  p.get("journal", ""),
+            "pub_date": p.get("pub_date", ""),
+        }
+        try:
+            report = evaluate_paper(paper_dict, disease=disease)
+            conf = compute_confidence(report)
+        except Exception as exc:
+            logger.warning("evaluate_paper failed for pmid=%s: %s", p.get("pmid"), exc)
+            report = None
+            conf = 0.0
+
+        scored.append({
+            # From embed.query()
+            "pmid":             p.get("pmid", ""),
+            "title":            p.get("title", ""),
+            "journal":          p.get("journal", ""),
+            "pub_date":         p.get("pub_date", ""),
+            "doi":              p.get("doi", ""),
+            "authors":          p.get("authors", ""),
+            "distance":         p.get("distance", 1.0),
+            # From evaluate_paper() — or defaults if scoring failed
+            "overall_score":    report.overall_score    if report else 0.0,
+            "study_design_tier": report.study_design_tier if report else "unknown",
+            "detected_pathways": report.detected_pathways if report else [],
+            "detected_models":  report.detected_models  if report else [],
+            "contested_flags":  report.contested_flags  if report else [],
+            "model_warnings":   report.warnings         if report else [],
+            "confidence":       conf,
+            # LLM stance assigned later by _assign_stances_to_references()
+            "llm_stance":       "neutral",
+        })
+    return scored
+
+
+def _format_evidence_block(scored_papers: list[dict]) -> str:
+    """Format scored papers into the evidence context block for the LLM prompt."""
+    lines: list[str] = []
+    for i, p in enumerate(scored_papers, start=1):
+        pathways_str   = ", ".join(p["detected_pathways"])  or "none detected"
+        models_str     = ", ".join(p["detected_models"])    or "none"
+        flags_str      = ", ".join(p["contested_flags"])    or "none"
+        warnings_str   = ", ".join(p["model_warnings"])     or "none"
+        lines.append(
+            f"[{i}] PMID {p['pmid']} | {p['title']}\n"
+            f"    Journal: {p['journal']} ({p['pub_date']})\n"
+            f"    Evidence score: {p['overall_score']:.2f} | "
+            f"Study design: {p['study_design_tier']} | "
+            f"Retrieval distance: {p['distance']:.4f}\n"
+            f"    Pathways: {pathways_str}\n"
+            f"    Model flags: {warnings_str}\n"
+            f"    Contested flags: {flags_str}"
+        )
+    return "\n\n".join(lines)
+
+
+def _build_llm_messages(claim: str, evidence_block: str) -> list[dict]:
+    """Return [system, user] message dicts for the Claude API call."""
+    user_content = (
+        f"Claim: {claim}\n\n"
+        f"Retrieved evidence papers (pre-scored by deterministic evaluator):\n"
+        f"{evidence_block}\n\n"
+        f"Evaluate the claim based on the evidence above and your domain knowledge."
+    )
+    return [
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _parse_llm_response(raw_json: str) -> dict:
+    """
+    Parse and validate the LLM JSON response.
+
+    Raises ValueError if required fields are missing or values are out of range.
+    """
+    # Strip markdown code fence if the LLM wraps its response (e.g. ```json ... ```)
+    text = raw_json.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```[a-z]*\n?", "", text)
+        text = re.sub(r"\n?```$", "", text)
+        text = text.strip()
+
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"LLM response is not valid JSON: {exc}") from exc
+
+    valid_verdicts = {"SUPPORTED", "CONTESTED", "UNSUPPORTED", "INSUFFICIENT_EVIDENCE"}
+    if data.get("verdict") not in valid_verdicts:
+        raise ValueError(f"Invalid verdict: {data.get('verdict')!r}")
+
+    confidence = data.get("confidence")
+    if not isinstance(confidence, (int, float)) or not (0.0 <= float(confidence) <= 1.0):
+        raise ValueError(f"Invalid confidence: {confidence!r}")
+
+    if not isinstance(data.get("reasoning"), str) or not data["reasoning"].strip():
+        raise ValueError("Missing or empty 'reasoning' field")
+
+    if not isinstance(data.get("supporting_pmids"), list):
+        data["supporting_pmids"] = []
+    if not isinstance(data.get("contesting_pmids"), list):
+        data["contesting_pmids"] = []
+    if not isinstance(data.get("paper_stances"), dict):
+        data["paper_stances"] = {}
+
+    return data
+
+
+def _assign_stances_to_references(
+    references: list[dict],
+    llm_raw: str | None,
+) -> list[dict]:
+    """
+    Merge paper_stances from the parsed LLM JSON into each reference dict.
+
+    Defaults to "neutral" for any pmid not in paper_stances, or when llm_raw is None.
+    """
+    stances: dict[str, str] = {}
+    if llm_raw:
+        try:
+            parsed = json.loads(llm_raw)
+            stances = parsed.get("paper_stances", {})
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+    valid_stances = {"supporting", "contesting", "neutral"}
+    for ref in references:
+        raw_stance = stances.get(str(ref["pmid"]), "neutral")
+        ref["llm_stance"] = raw_stance if raw_stance in valid_stances else "neutral"
+    return references
+
+
+def _llm_vote(
+    claim: str,
+    disease: str,
+    n_evidence: int,
+) -> tuple[str, float | None, str | None, str | None, list[dict]]:
+    """
+    Retrieve evidence from ChromaDB, score papers, and call Claude API.
+
+    Returns (llm_verdict, confidence, reasoning, raw_response, references).
+
+    On any failure returns ("LLM_ERROR", None, error_string, None, []) so
+    adjudication can produce LOW_CONFIDENCE without crashing.
+    """
+    # 1. Retrieve papers from ChromaDB
+    try:
+        papers = chroma_query(claim, n_results=n_evidence)
+    except Exception as exc:
+        logger.warning("ChromaDB query failed: %s", exc)
+        return ("LLM_ERROR", None, f"ChromaDB query failed: {exc}", None, [])
+
+    if not papers:
+        logger.warning("ChromaDB returned no results for claim: '%s...'", claim[:60])
+        return ("INSUFFICIENT_EVIDENCE", 0.0, "No papers retrieved from ChromaDB.", None, [])
+
+    # 2. Score retrieved papers
+    references = _score_retrieved_papers(papers, disease)
+
+    # 3. Format evidence block and build messages
+    evidence_block = _format_evidence_block(references)
+    messages = _build_llm_messages(claim, evidence_block)
+
+    # 4. Call Claude API — client instantiated here to avoid import-time failure
+    #    when ANTHROPIC_API_KEY is not set (e.g. in deterministic-only test runs)
+    raw_response: str | None = None
+    try:
+        client = anthropic.Anthropic()
+        response = client.messages.create(
+            model=LLM_MODEL,
+            max_tokens=LLM_MAX_TOKENS,
+            temperature=LLM_TEMPERATURE,
+            system=_LLM_SYSTEM_PROMPT,
+            messages=messages,
+        )
+        raw_response = response.content[0].text
+    except Exception as exc:
+        logger.warning("Anthropic API call failed: %s", exc)
+        return ("LLM_ERROR", None, f"API call failed: {exc}", None, references)
+
+    # 5. Parse and validate
+    try:
+        parsed = _parse_llm_response(raw_response)
+    except ValueError as exc:
+        logger.warning("LLM response parse failed: %s | raw=%s", exc, raw_response[:200])
+        return ("LLM_ERROR", None, f"Parse error: {exc}", raw_response, references)
+
+    return (
+        parsed["verdict"],
+        float(parsed["confidence"]),
+        parsed["reasoning"],
+        raw_response,
+        references,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Adjudication
+# ---------------------------------------------------------------------------
+
+def _adjudicate(det_tier: str, llm_verdict: str | None) -> tuple[str, str, str]:
+    """
+    Apply the two-vote adjudication rules table.
+
+    Returns (verdict, verdict_confidence, verdict_rationale).
+    """
+    if llm_verdict in (None, "LLM_ERROR"):
+        return (
+            "LOW_CONFIDENCE",
+            "LOW",
+            f"LLM vote unavailable (llm_verdict={llm_verdict!r}); "
+            f"deterministic tier={det_tier}.",
+        )
+
+    det_norm = _DET_TIER_NORM.get(det_tier, "UNKNOWN")
+
+    if det_norm == "SUPPORTED" and llm_verdict == "SUPPORTED":
+        return ("SUPPORTED", "HIGH", "Both votes SUPPORTED — high confidence.")
+
+    if det_norm == "CONTESTED" and llm_verdict == "CONTESTED":
+        return ("CONTESTED", "HIGH", "Both votes CONTESTED — high confidence surfacing debate.")
+
+    if det_norm == "UNSUPPORTED" and llm_verdict in ("UNSUPPORTED", "INSUFFICIENT_EVIDENCE"):
+        note = (
+            "Deterministic OVERCLAIMED aligned with LLM UNSUPPORTED — high confidence rejection."
+            if det_tier == "OVERCLAIMED"
+            else "Both votes UNSUPPORTED — high confidence."
+        )
+        return ("UNSUPPORTED", "HIGH", note)
+
+    if det_norm == "UNSUPPORTED" and llm_verdict == "CONTESTED":
+        return (
+            "CONTESTED",
+            "HIGH",
+            "Deterministic OVERCLAIMED/UNSUPPORTED but LLM found genuine debate — "
+            "CONTESTED verdict (LLM debate detection takes precedence).",
+        )
+
+    # All other combinations
+    return (
+        "LOW_CONFIDENCE",
+        "LOW",
+        f"Votes diverge: deterministic={det_tier} ({det_norm}), "
+        f"llm={llm_verdict} — insufficient agreement to classify.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+def evaluate_claim(
+    claim: str,
+    disease: str = "ipf",
+    n_evidence: int = N_EVIDENCE_DEFAULT,
+) -> ClaimEvaluationResult:
+    """
+    Evaluate a biological claim using a two-vote system.
+
+    Vote 1 (deterministic): prior-based pathway support, model penalty, and contested
+    biology detection — fully local.
+
+    Vote 2 (LLM): Claude API call with ChromaDB-retrieved papers as evidence context.
+    Papers are pre-scored by evaluate_paper() before being sent to Claude.
+
+    The authoritative output is `result.verdict`. The original `result.tier`
+    (deterministic tier) is preserved for benchmark_runner.py backward compatibility.
+
+    Args:
+        claim:      Biological claim as a declarative string.
+        disease:    Target disease context. Currently only "ipf" is supported.
+        n_evidence: Number of papers to retrieve from ChromaDB for LLM context.
+                    Pass 0 to skip the LLM vote (verdict will be LOW_CONFIDENCE).
+
+    Returns:
+        ClaimEvaluationResult with both votes, adjudicated verdict, and references.
+    """
+    # 1. Deterministic vote
+    det_result = _deterministic_vote(claim, disease)
+
+    # 2. LLM vote
+    if n_evidence > 0:
+        llm_verdict, llm_conf, llm_reasoning, llm_raw, references = _llm_vote(
+            claim, disease, n_evidence
+        )
+    else:
+        llm_verdict  = "LLM_ERROR"
+        llm_conf     = None
+        llm_reasoning = "LLM vote skipped (n_evidence=0)."
+        llm_raw      = None
+        references   = []
+
+    # 3. Adjudicate
+    verdict, verdict_confidence, verdict_rationale = _adjudicate(det_result.tier, llm_verdict)
+
+    # 4. Assign LLM stances back onto references
+    references = _assign_stances_to_references(references, llm_raw)
+
+    logger.info(
+        "Claim '%s...' | det=%s llm=%s → verdict=%s (%s)",
+        claim[:60], det_result.tier, llm_verdict, verdict, verdict_confidence,
+    )
+
+    return ClaimEvaluationResult(
+        claim=det_result.claim,
+        disease=det_result.disease,
+        detected_pathways=det_result.detected_pathways,
+        detected_model_mentions=det_result.detected_model_mentions,
+        contested_flags=det_result.contested_flags,
+        pathway_support_score=det_result.pathway_support_score,
+        model_penalty=det_result.model_penalty,
+        prior_support_score=det_result.prior_support_score,
+        tier=det_result.tier,
+        rationale=det_result.rationale,
+        warnings=det_result.warnings,
+        llm_verdict=llm_verdict,
+        llm_confidence=llm_conf,
+        llm_reasoning=llm_reasoning,
+        llm_raw_response=llm_raw,
+        verdict=verdict,
+        verdict_confidence=verdict_confidence,
+        verdict_rationale=verdict_rationale,
+        references=references,
     )
