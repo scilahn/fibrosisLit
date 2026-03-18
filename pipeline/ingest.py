@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any
@@ -65,6 +66,49 @@ def _get(url: str, params: dict[str, Any], timeout: int = 15) -> dict[str, Any]:
     response.raise_for_status()
     time.sleep(_REQUEST_DELAY_S)
     return response.json()
+
+
+# ---------------------------------------------------------------------------
+# PubMed query helpers
+# ---------------------------------------------------------------------------
+
+_MESH_ANCHORS: dict[str, str] = {
+    "ipf": '"idiopathic pulmonary fibrosis"[MeSH Terms]',
+    "psc": '"cholangitis, sclerosing"[MeSH Terms]',
+}
+
+# Disease name variants stripped from caller text to avoid duplicating the anchor.
+_DISEASE_VARIANTS_RE = re.compile(
+    r"\b(IPF|idiopathic pulmonary fibrosis|PSC|primary sclerosing cholangitis)\b",
+    re.IGNORECASE,
+)
+
+
+def make_mesh_query(text: str, disease: str = "ipf") -> str:
+    """
+    Prepend a MeSH disease anchor to a compound biological text string.
+
+    Strips any disease name variants already present in `text` (to avoid
+    duplication), then prepends the canonical MeSH anchor for `disease`.
+    The result is a valid PubMed query string that returns far more results
+    than a raw compound string because PubMed applies MeSH expansion.
+
+    Args:
+        text:    A compound biological string (key terms, claim text, etc.).
+        disease: Target disease key — "ipf" or "psc".
+
+    Returns:
+        PubMed query string, e.g.:
+        '"idiopathic pulmonary fibrosis"[MeSH Terms] SPP1 macrophage myofibroblast'
+
+    Example:
+        >>> make_mesh_query("SPP1 macrophage myofibroblast IPF single-cell atlas")
+        '"idiopathic pulmonary fibrosis"[MeSH Terms] SPP1 macrophage myofibroblast single-cell atlas'
+    """
+    anchor = _MESH_ANCHORS.get(disease.lower(), disease)
+    clean = _DISEASE_VARIANTS_RE.sub("", text)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return f"{anchor} {clean}" if clean else anchor
 
 
 # ---------------------------------------------------------------------------

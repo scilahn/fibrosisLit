@@ -17,7 +17,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from dotenv import load_dotenv
 load_dotenv()
 
-from pipeline.ingest import search_pubmed, fetch_by_pmids
+from pipeline.ingest import search_pubmed, fetch_by_pmids, make_mesh_query
 from pipeline.embed import embed_and_store, query as chroma_query
 from evaluators.evidence_quality import evaluate_paper
 from evaluators.confidence_scorer import compute_confidence
@@ -77,7 +77,28 @@ def print_table(rows: list[dict]) -> None:
             print(f"    {line}")
 
 
-def run(query: str, max_results: int = 50) -> list[dict]:
+def ingest_papers(query: str, max_results: int = 200) -> int:
+    """
+    Search PubMed and upsert results into ChromaDB. Returns count upserted.
+
+    Use this to pre-populate ChromaDB before running evaluate_claim() or
+    benchmark_runner. The query should be a MeSH-anchored PubMed string —
+    use pipeline.ingest.make_mesh_query() to build one.
+
+    Args:
+        query:       PubMed query string (MeSH-anchored recommended).
+        max_results: Maximum papers to fetch and upsert.
+
+    Returns:
+        Number of documents upserted into ChromaDB.
+    """
+    papers = search_pubmed(query, max_results=max_results)
+    if not papers:
+        return 0
+    return embed_and_store(papers)
+
+
+def run(query: str, max_results: int = 200) -> list[dict]:
     """Execute the full search → embed → evaluate pipeline and return rows.
 
     Returns a list of dicts (one per paper) sorted by confidence descending,
@@ -150,7 +171,7 @@ def main() -> None:
             sys.exit(1)
 
     raw = input("How many papers to search/query? [default 50]: ").strip()
-    max_results = int(raw) if raw.isdigit() else 50
+    max_results = int(raw) if raw.isdigit() else 200
 
     rows = run(query, max_results)
     print_table(rows)

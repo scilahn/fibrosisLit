@@ -41,6 +41,9 @@ import anthropic
 from dotenv import load_dotenv
 
 from domain_knowledge.fibrosis_priors import (
+    MODELS,
+    PATHWAYS,
+    CONTESTED_BIOLOGY,
     get_pathway_prior,
     get_model,
     has_flag,
@@ -150,24 +153,20 @@ CLAIM_MODEL_PATTERNS: list[tuple[str, list[str]]] = [
 # LLM system prompt
 # ---------------------------------------------------------------------------
 
-_LLM_SYSTEM_PROMPT: str = """\
-You are an expert in IPF (idiopathic pulmonary fibrosis) biology with knowledge of \
-translational medicine and clinical trial history. Evaluate whether a biological claim \
-is SUPPORTED, CONTESTED, or UNSUPPORTED based on retrieved evidence.
+_LLM_BASE_INSTRUCTIONS: str = """\
+You are an expert in IPF (idiopathic pulmonary fibrosis) biology evaluating whether a
+biological claim is SUPPORTED, CONTESTED, or UNSUPPORTED based on retrieved evidence
+and the domain priors below.
 
-Critical rules:
-1. Human biopsy / single-cell atlas / clinical trial data outweighs animal model data. \
-Weight evidence accordingly.
-2. Bleomycin acute mouse results are weak IPF evidence — flag claims resting primarily \
-on them as having poor translational support.
-3. The M1/M2 macrophage framework is contested in fibrosis. Do NOT return SUPPORTED for \
-claims invoking M1/M2 polarization without flagging this as a contested framework.
-4. Myofibroblast reversibility is an active debate. Surface both positions; do NOT resolve it.
-5. Clinical trial failures outweigh preclinical mechanistic papers — cite them if relevant.
-6. Never synthesize contradictory evidence into a confident conclusion. If genuine \
-disagreement exists in the evidence, return CONTESTED.
-7. INSUFFICIENT_EVIDENCE is correct when the retrieved papers do not meaningfully address \
-the claim — not when papers disagree.
+Evaluation rules:
+1. Weight evidence by the model hierarchy scores — higher-score models outweigh lower-score ones.
+2. Claims resting solely on models flagged poor_ipf_translation are weak IPF evidence.
+3. Never synthesize contested biology debates into a confident conclusion — surface all
+   competing positions listed below and return CONTESTED unless evidence overwhelmingly
+   favours one side.
+4. Clinical trial failures outweigh preclinical mechanistic papers — cite them if relevant.
+5. INSUFFICIENT_EVIDENCE is correct when the retrieved papers do not meaningfully address
+   the claim — not when papers disagree.
 
 Return ONLY valid JSON matching this exact schema — no text outside the JSON object:
 {
@@ -179,6 +178,45 @@ Return ONLY valid JSON matching this exact schema — no text outside the JSON o
   "paper_stances": {"<pmid>": "supporting" | "contesting" | "neutral", ...}
 }\
 """
+
+
+def _build_system_prompt() -> str:
+    """
+    Build the LLM system prompt, injecting all current fibrosis_priors at call time.
+
+    Reads MODELS, PATHWAYS, and CONTESTED_BIOLOGY directly so the prompt stays in
+    sync with fibrosis_priors.py without any manual updates to this file.
+    """
+    sections: list[str] = [_LLM_BASE_INSTRUCTIONS]
+
+    # ── Model hierarchy ──────────────────────────────────────────────────────
+    lines = ["=== Preclinical Model Hierarchy (translational relevance 0–1) ==="]
+    for key, m in sorted(MODELS.items(), key=lambda kv: kv[1].score, reverse=True):
+        flags_str = f"  [FLAGS: {', '.join(m.flags)}]" if m.flags else ""
+        lines.append(f"  {key} (score={m.score:.2f}){flags_str}: {m.rationale}")
+    sections.append("\n".join(lines))
+
+    # ── Pathway priors ───────────────────────────────────────────────────────
+    lines = ["=== IPF Pathway Priors (prior support score) ==="]
+    for key, p in sorted(PATHWAYS.items(), key=lambda kv: kv[1].prior, reverse=True):
+        lines.append(
+            f"  {key} ({p.centrality.value}, prior={p.prior:.2f}): {p.rationale}"
+        )
+    sections.append("\n".join(lines))
+
+    # ── Contested biology ────────────────────────────────────────────────────
+    lines = [
+        "=== Contested Biology (surface ALL positions — never resolve) ===",
+        "For any claim touching these topics, present all positions and return CONTESTED "
+        "unless one side has overwhelming human clinical evidence.",
+    ]
+    for key, cb in CONTESTED_BIOLOGY.items():
+        lines.append(f"\n  {key}: {cb.debate}")
+        for i, pos in enumerate(cb.positions, start=1):
+            lines.append(f"    Position {i}: {pos}")
+    sections.append("\n".join(lines))
+
+    return "\n\n".join(sections)
 
 
 # ---------------------------------------------------------------------------
@@ -578,7 +616,7 @@ def _llm_vote(
             model=LLM_MODEL,
             max_tokens=LLM_MAX_TOKENS,
             temperature=LLM_TEMPERATURE,
-            system=_LLM_SYSTEM_PROMPT,
+            system=_build_system_prompt(),
             messages=messages,
         )
         raw_response = response.content[0].text

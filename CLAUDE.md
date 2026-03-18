@@ -8,12 +8,7 @@ retrieval fine. This project addresses what they get wrong: evidence quality ass
 for a disease area with contested biology and known preclinical model translation failures.
 
 ## Owner Background
-Richard Ahn, PhD — computational biologist with 3+ years analyzing IPF and PSC datasets
-at Pliant Therapeutics (clinical-stage biotech). Direct experience with:
-- snRNA-seq on precision-cut lung and liver slices from IPF/PSC/PBC patients
-- Olink and SomaScan proteomics for pharmacodynamic biomarker identification
-- αvβ6/αvβ1 integrin biology (bexotegrast program)
-- SPP1+ macrophage and myofibroblast populations in fibrotic tissue
+Richard Ahn, PhD — computational biologist 
 
 ## Primary Contribution Areas
 1. domain_knowledge/ — biological priors, evidence taxonomy, contested biology docs
@@ -32,16 +27,9 @@ at Pliant Therapeutics (clinical-stage biotech). Direct experience with:
 - Python 3.11+
 - ChromaDB (local vector store)
 - Claude API (claude-sonnet-4-20250514) for evaluation agents
-- AWS S3 for paper storage and ChromaDB snapshots
-- PubMed E-utilities API (no key needed for low volume; NCBI key for higher volume)
 
 ## Environment Variables (in .env, never commit)
 ANTHROPIC_API_KEY=
-AWS_ACCESS_KEY_ID=
-AWS_SECRET_ACCESS_KEY=
-AWS_DEFAULT_REGION=us-west-2
-S3_BUCKET_NAME=fibrosislens-papers
-NCBI_API_KEY=  # optional but recommended
 
 ## Code Style
 - Type hints on all functions
@@ -122,3 +110,51 @@ contested_flags (semicolon-joined), model_warnings (semicolon-joined)
 Elicit/Consensus comparison is a manual scoring step — runner only covers
 FibrosisLit. Comparison tool outputs will be scored by hand against the
 same rubric and added to a separate CSV column later.
+
+## Next Build: Refactor claim_evaluator.py — voting system + references
+
+### Voting system
+Two independent voters, adjudicated by fixed rules:
+
+Voter 1 (deterministic):
+- Existing prior-based logic unchanged
+- Returns: verdict, tier, rationale list, contested_flags, model_warnings
+
+Voter 2 (LLM — claude-sonnet-4-20250514):
+- Input: retrieved paper titles + abstracts (raw text, not pre-scored)
+- System prompt includes: fibrosis_priors contested biology positions,
+  model hierarchy scores, instruction to flag trial failures and
+  drug-specific evidence
+- Returns JSON: {verdict, confidence, reasoning, evidence_used}
+- Verdicts: SUPPORTED | CONTESTED | UNSUPPORTED | INSUFFICIENT_EVIDENCE
+
+Adjudication rules (in priority order):
+1. If Voter 1 contested_flag fires → final = CONTESTED regardless of Voter 2
+2. If both voters agree → final = that verdict, confidence = HIGH
+3. OVERCLAIMED + UNSUPPORTED → final = UNSUPPORTED, confidence = HIGH
+4. OVERCLAIMED + CONTESTED → final = CONTESTED, confidence = MEDIUM
+5. Any other disagreement → final = LOW_CONFIDENCE, surface both verdicts
+
+### References
+Add retrieved_papers to ClaimEvaluationResult:
+  List of dicts: pmid, title, journal, year, distance, quality_score
+  Printed in output after verdict
+
+### Updated ClaimEvaluationResult fields
+- claim: str
+- final_verdict: str
+- final_confidence: str  # HIGH | MEDIUM | LOW_CONFIDENCE
+- voter1_verdict: str
+- voter2_verdict: str
+- voter2_reasoning: str  # raw LLM output
+- retrieved_papers: list[dict]  # pmid, title, journal, year, distance, quality_score
+- contested_flags: list[ContestedFlag]
+- model_warnings: list[str]
+- rationale: list[str]  # deterministic audit trail
+
+### Constraints unchanged
+- Voter 1 contested flag is a hard override
+- LLM system prompt must instruct: surface contested biology as
+  unresolved alternatives, never synthesize
+- LLM returns JSON only, no prose wrapper
+- All decisions logged to rationale list

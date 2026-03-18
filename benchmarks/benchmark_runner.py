@@ -33,11 +33,57 @@ sys.path.insert(0, str(pathlib.Path(__file__).parent.parent))
 from benchmarks.benchmark_claims import BENCHMARK_CLAIMS, BenchmarkClaim, ExpectedVerdict
 from evaluators.claim_evaluator import evaluate_claim, ClaimEvaluationResult
 from evaluators.contradiction_detector import ContestedFlag
+from pipeline.ingest import make_mesh_query
+from scripts.search_eval import ingest_papers
 
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
 RESULTS_DIR = pathlib.Path(__file__).parent / "results"
+
+# ---------------------------------------------------------------------------
+# ChromaDB seeding
+# ---------------------------------------------------------------------------
+
+# One query per claim-domain cluster, covering all 25 benchmark claims.
+# Each string is passed through make_mesh_query() before PubMed search.
+_SEED_QUERIES: list[str] = [
+    # WS-01, WS-05, CT-01, CT-02 — macrophage / fibroblast single-cell
+    "SPP1 macrophage myofibroblast CTHRC1 fibroblast single-cell atlas",
+    # WS-02, WS-03, WS-06 — integrin / TGF-β / SMAD axis
+    "TGF-beta SMAD integrin avb6 avb1 bexotegrast latent activation",
+    # WS-04, WS-08, OC-06 — approved drugs / clinical trials / PDE4
+    "nerandomilast nintedanib PDE4 FIBRONEER clinical trial FVC",
+    # WS-07, CT-03 — aberrant basaloid / EMT
+    "aberrant basaloid KRT17 epithelial mesenchymal transition",
+    # CT-04, CT-07, OC-04 — IL-13 / autotaxin / ATX
+    "IL-13 autotaxin ATX LPA fibrosis progression",
+    # CT-05, CT-06, OC-01, OC-03, OC-07 — bleomycin model / fibrosis resolution
+    "bleomycin mouse model fibrosis resolution regression",
+    # OC-02 — CSF1R / macrophage therapy
+    "CSF1R M-CSF macrophage colony stimulating factor therapy",
+    # OC-05 — liver fibrosis cross-organ
+    "liver fibrosis resolution reversal cross-organ applicability",
+]
+
+
+def seed_chromadb(disease: str = "ipf", max_results: int = 200) -> None:
+    """
+    Populate ChromaDB with papers covering all 25 benchmark claim domains.
+
+    Runs 8 topic-area PubMed queries (MeSH-anchored for disease) and upserts
+    results into the local ChromaDB instance. Call this once before run() if
+    ChromaDB is empty or stale.
+
+    Args:
+        disease:     Disease context passed to make_mesh_query() ("ipf" or "psc").
+        max_results: Maximum papers to fetch per query.
+    """
+    print(f"Seeding ChromaDB for disease={disease!r} ({len(_SEED_QUERIES)} queries)…")
+    for topic in _SEED_QUERIES:
+        query = make_mesh_query(topic, disease=disease)
+        n = ingest_papers(query, max_results=max_results)
+        print(f"  seeded {n:>4} papers | {query[:80]}")
 
 # Map claim_evaluator tier → benchmark verdict vocabulary.
 # OVERCLAIMED maps to UNSUPPORTED; INSUFFICIENT_EVIDENCE is handled in _is_correct().
@@ -196,6 +242,7 @@ def _print_accuracy_summary(rows: list[dict]) -> None:
 def run(
     disease: str = "ipf",
     output_dir: pathlib.Path = RESULTS_DIR,
+    seed: bool = False,
 ) -> list[dict]:
     """
     Run all benchmark claims through evaluate_claim and write results.
@@ -210,10 +257,15 @@ def run(
     Args:
         disease:    Disease context passed through to evaluate_claim().
         output_dir: Directory for output files (created if absent).
+        seed:       If True, populate ChromaDB with topic-area queries before
+                    running claims. Use when ChromaDB is empty or stale.
 
     Returns:
         List of CSV-format row dicts (one per claim), suitable for display.
     """
+    if seed:
+        seed_chromadb(disease=disease)
+
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     json_path = output_dir / f"results_{timestamp}.json"
@@ -267,7 +319,14 @@ def run(
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    rows = run()
+    import argparse
+    p = argparse.ArgumentParser(description="Run FibrosisLit benchmark claims.")
+    p.add_argument("--seed", action="store_true",
+                   help="Seed ChromaDB with topic-area PubMed queries before running.")
+    p.add_argument("--disease", default="ipf",
+                   help="Disease context for MeSH anchoring (default: ipf).")
+    args = p.parse_args()
+    rows = run(disease=args.disease, seed=args.seed)
     _print_summary_table(rows)
     _print_accuracy_summary(rows)
 
