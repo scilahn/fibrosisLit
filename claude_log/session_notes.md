@@ -169,16 +169,51 @@ Fix: widened to `{0,200}` and added reverse direction. Same fix to `single_cell_
 
 ---
 
-## Current State (2026-03-18)
+### Phase 8 — Comparison Infrastructure (2026-03-19)
+
+**`benchmarks/comparison/`** — new directory for head-to-head scoring:
+
+**`benchmarks/comparison/README.md`**
+Documents the full comparison workflow: querying Elicit, Consensus, and Semantic Scholar
+by hand, recording verdicts in the template CSV, and running the analysis notebook.
+Includes:
+- Verdict vocabulary (SUPPORTED / CONTESTED / UNSUPPORTED / INSUFFICIENT_EVIDENCE)
+- Per-tool output → verdict mapping rules (Elicit confidence language, Consensus Meter %, Semantic Scholar retrieval-only default)
+- Correctness rules per tier (OVERCLAIMED: UNSUPPORTED or INSUFFICIENT_EVIDENCE both count as correct)
+- Binary scoring policy (correct = 1/0; nuance captured in `*_response` free text)
+
+**`benchmarks/comparison/generate_template.py`**
+Imports `BENCHMARK_CLAIMS` and writes `comparison_template.csv` (22 rows, 15 columns).
+Columns: `claim_id`, `tier`, `claim`, `expected_verdict`, `failure_mode`, `scoring_notes`,
+then `*_response`, `*_verdict`, `*_correct` for each of three tools (blank for manual entry).
+Re-runnable if claims change.
+
+**`benchmarks/comparison/comparison_template.csv`**
+22 rows pre-filled from `BenchmarkClaim` data. Tool verdict columns blank — filled by
+Richard after querying each tool.
+
+**`notebooks/comparison_analysis.ipynb`**
+12-cell analysis notebook. Once the CSV is filled:
+1. Loads latest `benchmarks/results/results_*.csv` → FibrosisLit two-vote verdicts
+2. Loads `comparison_template.csv` → external tool verdicts
+3. Merges on `claim_id`, computes `*_correct` for all four tools
+4. Displays overall accuracy table, per-tier accuracy table, full verdict table (with ✓/✗),
+   and failure mode analysis (which claims each tool failed + `failure_mode` text)
+
+---
+
+## Current State (2026-03-19)
 
 **Integration tests:** All 3 pass (after Phases 6–7 fixes)
 - WS-01: SUPPORTED ✓
 - CT-02: CONTESTED ✓
 - OC-01: UNSUPPORTED ✓
 
-**Benchmark notebook:** `test/benchmark_runner_test.ipynb` created — seeds ChromaDB, runs all 25 claims, displays summary table + per-tier accuracy + failures table.
+**Benchmark notebook:** `test/benchmark_runner_test.ipynb` created — seeds ChromaDB, runs all 22 claims, displays summary table + per-tier accuracy + failures table.
 
-**Known accuracy ceiling (deterministic voter alone):** ~76% (19/25) — claim types requiring clinical trial outcome knowledge (WS-04 nerandomilast FIBRONEER, OC-04 anti-IL-13, etc.) can't be scored from pathway priors alone. Two-vote system expected to improve OC claim accuracy.
+**Two-vote benchmark result (2026-03-18):** 17/22 (77.3%) overall — contested 6/7 (85.7%), overclaimed 4/7 (57.1%), well_supported 7/8 (87.5%).
+
+**Comparison infrastructure:** `benchmarks/comparison/` created — template CSV (22 rows), scoring rubric, and analysis notebook ready for manual tool scoring (Elicit, Consensus, Semantic Scholar).
 
 ---
 
@@ -195,7 +230,7 @@ Fix: widened to `{0,200}` and added reverse direction. Same fix to `single_cell_
 ## Known Gaps / Future Work
 
 - **PSC priors** not yet implemented — `disease="psc"` is reserved but `_MESH_ANCHORS` only has IPF and PSC entries; PSC-specific MODELS/PATHWAYS/CONTESTED_BIOLOGY not in `fibrosis_priors.py`
-- **Elicit/Consensus comparison** columns in benchmark CSV not yet filled — manual scoring step; the runner produces the FibrosisLit column only
+- **Elicit/Consensus/Semantic Scholar comparison** template ready (`benchmarks/comparison/comparison_template.csv`) — manual scoring step; fill tool verdict columns by querying each tool per `benchmarks/comparison/README.md`, then run `notebooks/comparison_analysis.ipynb`
 - **Regex pattern coverage** — model detection and study design tier remain regex-based; novel phrasing (e.g., "10x Genomics", "Visium spatial") not always caught; monitored via notebook reference tables
 - **Abstract text quality** — efetch plain text includes citation header (authors, journal, DOI) before the abstract paragraph; evaluators function correctly but noise is higher than a clean abstract would be
 - **Asymmetric embedding** — `embed.query()` uses the same proximity adapter for both indexing (full abstract) and querying (short claim text); the adhoc_query adapter is designed for this asymmetric use case and could improve retrieval quality
@@ -218,5 +253,9 @@ Fix: widened to `{0,200}` and added reverse direction. Same fix to `single_cell_
 | `benchmarks/benchmark_claims.py` | 25 annotated benchmark claims |
 | `benchmarks/benchmark_runner.py` | Full benchmark run + seed_chromadb() + CLI flags |
 | `test/test_claim_evaluator_two_vote.ipynb` | 3-claim integration test (all passing) |
-| `test/benchmark_runner_test.ipynb` | Full 25-claim benchmark notebook |
+| `test/benchmark_runner_test.ipynb` | Full 22-claim benchmark notebook |
 | `notebooks/search_eval_ui.ipynb` | ipywidgets search UI |
+| `benchmarks/comparison/README.md` | Comparison workflow, scoring rubric, verdict mapping rules |
+| `benchmarks/comparison/generate_template.py` | Generates blank comparison_template.csv from BENCHMARK_CLAIMS |
+| `benchmarks/comparison/comparison_template.csv` | 22-row scoring sheet for Elicit/Consensus/Semantic Scholar |
+| `notebooks/comparison_analysis.ipynb` | Accuracy + failure mode analysis after manual tool scoring |
